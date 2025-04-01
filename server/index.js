@@ -6,6 +6,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+app.use(express.json()); // Add this to parse JSON request bodies
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -18,17 +19,77 @@ const io = new Server(server, {
 // Store connected computers
 const connectedComputers = new Map();
 
+// Store registered computers (including offline ones)
+const registeredComputers = new Map();
+
+// Store connection codes for pairing
+const connectionCodes = new Map();
+
 // API routes
 app.get('/api/computers', (req, res) => {
-    const computers = Array.from(connectedComputers.values()).map(computer => ({
-        id: computer.id,
-        name: computer.name,
-        ip: computer.ip,
-        status: 'online',
-        lastSeen: computer.lastSeen
-    }));
+    // Get all computers (both online and registered but offline)
+    const allComputers = [];
 
-    res.json(computers);
+    // First add all online computers
+    for (const computer of connectedComputers.values()) {
+        allComputers.push({
+            id: computer.id,
+            name: computer.name,
+            ip: computer.ip,
+            status: 'online',
+            lastSeen: computer.lastSeen
+        });
+    }
+
+    // Then add registered but offline computers
+    for (const [id, computer] of registeredComputers.entries()) {
+        // Skip if already in the list (online)
+        if (!connectedComputers.has(id)) {
+            allComputers.push({
+                id: computer.id,
+                name: computer.name,
+                ip: computer.ip || 'unknown',
+                status: 'offline',
+                lastSeen: computer.lastSeen
+            });
+        }
+    }
+
+    res.json(allComputers);
+});
+
+// Register a new computer
+app.post('/api/computers/register', (req, res) => {
+    const { name, connectionCode } = req.body;
+
+    if (!name || !connectionCode) {
+        return res.status(400).json({ message: 'Computer name and connection code are required' });
+    }
+
+    // Generate a unique ID for the computer
+    const computerId = `reg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    // Store the computer in the registered computers map
+    registeredComputers.set(computerId, {
+        id: computerId,
+        name,
+        status: 'offline',
+        lastSeen: new Date(),
+        connectionCode
+    });
+
+    // Store the connection code for pairing
+    connectionCodes.set(connectionCode, computerId);
+
+    console.log(`Computer registered: ${name} with code ${connectionCode}`);
+
+    // Broadcast updated computer list
+    io.emit('computers-updated');
+
+    return res.status(201).json({
+        message: 'Computer registered successfully',
+        id: computerId
+    });
 });
 
 // Socket.io connection handling
@@ -38,19 +99,54 @@ io.on('connection', (socket) => {
 
     // Computer registration
     socket.on('register-computer', (data) => {
+        let id = socket.id;
+
+        // Check if this is a reconnection of a registered computer using connection code
+        if (data.connectionCode && connectionCodes.has(data.connectionCode)) {
+            const registeredId = connectionCodes.get(data.connectionCode);
+
+            if (registeredComputers.has(registeredId)) {
+                // Update the socket ID but keep the registered ID
+                id = registeredId;
+                const registered = registeredComputers.get(registeredId);
+                data.name = registered.name; // Use the registered name
+            }
+        }
+
         computerInfo = {
-            id: socket.id,
+            id: id,
             name: data.name,
             ip: socket.handshake.address,
             lastSeen: new Date(),
-            capabilities: data.capabilities || {}
+            capabilities: data.capabilities || {},
+            connectionCode: data.connectionCode
         };
 
         connectedComputers.set(socket.id, computerInfo);
+
+        // If this is a registered computer, update its status
+        if (registeredComputers.has(id)) {
+            registeredComputers.set(id, {
+                ...registeredComputers.get(id),
+                status: 'online',
+                lastSeen: new Date()
+            });
+        }
+
         console.log(`Computer registered: ${data.name}`);
 
         // Broadcast updated computer list
         io.emit('computers-updated');
+    });
+
+    // Computer pairing
+    socket.on('pair-computer', (data) => {
+        if (data.connectionCode && connectionCodes.has(data.connectionCode)) {
+            const computerId = connectionCodes.get(data.connectionCode);
+            socket.emit('computer-paired', { computerId });
+        } else {
+            socket.emit('pair-error', { message: 'Invalid connection code' });
+        }
     });
 
     // Stream data relay
@@ -65,6 +161,13 @@ io.on('connection', (socket) => {
         if (computerInfo) {
             computerInfo.lastSeen = new Date();
             connectedComputers.set(socket.id, computerInfo);
+
+            // Update registered computer's last seen as well
+            if (registeredComputers.has(computerInfo.id)) {
+                const registered = registeredComputers.get(computerInfo.id);
+                registered.lastSeen = new Date();
+                registeredComputers.set(computerInfo.id, registered);
+            }
         }
     });
 
@@ -104,6 +207,15 @@ io.on('connection', (socket) => {
         if (computerInfo) {
             console.log(`Computer disconnected: ${computerInfo.name}`);
             connectedComputers.delete(socket.id);
+
+            // Update registered computer's status if applicable
+            if (registeredComputers.has(computerInfo.id)) {
+                const registered = registeredComputers.get(computerInfo.id);
+                registered.status = 'offline';
+                registered.lastSeen = new Date();
+                registeredComputers.set(computerInfo.id, registered);
+            }
+
             // Broadcast updated computer list
             io.emit('computers-updated');
         }
@@ -118,6 +230,15 @@ setInterval(() => {
         if (timeDiff > 60000) { // 1 minute
             console.log(`Computer connection timed out: ${computer.name}`);
             connectedComputers.delete(id);
+
+            // Update registered computer's status if applicable
+            if (registeredComputers.has(computer.id)) {
+                const registered = registeredComputers.get(computer.id);
+                registered.status = 'offline';
+                registered.lastSeen = new Date();
+                registeredComputers.set(computer.id, registered);
+            }
+
             io.emit('computers-updated');
         }
     }

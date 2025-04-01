@@ -5,7 +5,7 @@ const os = require('os');
 const readline = require('readline');
 
 // Configuration
-const SERVER_URL = 'http://your-server-ip:3000'; // Replace with your server address
+const SERVER_URL = 'https://remote-monitor.onrender.com'; // Replace with your server address
 const DEFAULT_NAME = os.hostname();
 const FRAME_RATE = 15; // Frames per second
 const FRAME_INTERVAL = Math.floor(1000 / FRAME_RATE);
