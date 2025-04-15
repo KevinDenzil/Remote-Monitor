@@ -3,147 +3,280 @@ const io = require('socket.io-client');
 const nodeWebcam = require('node-webcam');
 const os = require('os');
 const readline = require('readline');
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
 
 // Configuration
 const SERVER_URL = 'https://remote-monitor.onrender.com'; // Replace with your server address
 const DEFAULT_NAME = os.hostname();
-const FRAME_RATE = 15; // Frames per second
+const FRAME_RATE = 5; // Reduced frame rate for lighter bandwidth usage
 const FRAME_INTERVAL = Math.floor(1000 / FRAME_RATE);
-const IMAGE_QUALITY = 50; // JPEG quality (0-100)
+const IMAGE_QUALITY = 30; // Reduced quality for lighter bandwidth usage
+const SOCKET_OPTIONS = {
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    timeout: 20000,
+    transports: ['websocket', 'polling'] // Try websocket first, fallback to polling
+};
 
-// Command line interface
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
+// Create a temp directory in a location we control
+const TEMP_DIR = path.join(os.tmpdir(), 'webcam-monitor');
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// First, check server connectivity
+console.log(`Testing connection to server: ${SERVER_URL}`);
+https.get(SERVER_URL, (res) => {
+    console.log(`Server responded with status code: ${res.statusCode}`);
+    startClient();
+}).on('error', (err) => {
+    console.error(`Server connection test failed: ${err.message}`);
+    console.log("Continuing anyway...");
+    startClient();
 });
 
-// Get computer name
-rl.question(`Enter computer name (default: ${DEFAULT_NAME}): `, (name) => {
-    const computerName = name || DEFAULT_NAME;
+function startClient() {
+    // Command line interface
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
 
-    console.log(`Starting webcam client for: ${computerName}`);
-    console.log(`Connecting to server: ${SERVER_URL}`);
+    // Get computer name
+    rl.question(`Enter computer name (default: ${DEFAULT_NAME}): `, (name) => {
+        const computerName = name || DEFAULT_NAME;
 
-    const socket = io(SERVER_URL);
+        console.log(`Starting webcam client for: ${computerName}`);
+        console.log(`Connecting to server: ${SERVER_URL}`);
+        console.log(`Frame rate: ${FRAME_RATE} FPS, Quality: ${IMAGE_QUALITY}%`);
 
-    // Set up webcam
-    const webcamOptions = {
-        width: 640,
-        height: 480,
-        quality: IMAGE_QUALITY,
-        output: 'jpeg',
-        device: false, // Use default webcam
-        callbackReturn: 'base64'
-    };
+        // Connect with more robust socket options
+        const socket = io(SERVER_URL, SOCKET_OPTIONS);
 
-    const Webcam = nodeWebcam.create(webcamOptions);
+        // Set up webcam with lower resolution and faster settings
+        const webcamOptions = {
+            width: 320,        // Low resolution
+            height: 240,       // Low resolution
+            quality: IMAGE_QUALITY,
+            output: 'jpeg',
+            device: false,     // Use default webcam
+            callbackReturn: 'base64',
+            saveShots: true,
+            location: TEMP_DIR,
+            verbose: true      // Set to true for more debugging
+        };
 
-    // Track active streams
-    const activeStreams = new Set();
+        const Webcam = nodeWebcam.create(webcamOptions);
 
-    // Register computer when connected
-    socket.on('connect', () => {
-        console.log('Connected to server');
+        // Track active streams
+        const activeStreams = new Set();
 
-        socket.emit('register-computer', {
-            name: computerName,
-            capabilities: {
-                webcam: true,
-                audio: false // Not implemented in this version
+        // Test webcam before starting
+        console.log("Testing webcam...");
+        Webcam.capture('test', (err, data) => {
+            if (err) {
+                console.error('Webcam test failed:', err);
+                console.log('Please make sure your webcam is connected and not in use by another application.');
+            } else {
+                console.log('Webcam test successful!');
+                // Log the size of the test image to help diagnose bandwidth issues
+                const base64Data = data.replace(/^data:image\/jpeg;base64,/, '');
+                console.log(`Test image size: ${Math.round(base64Data.length / 1024)} KB`);
             }
         });
 
-        console.log('Computer registered');
-        console.log('Waiting for stream requests...');
-    });
+        // Register computer when connected
+        socket.on('connect', () => {
+            console.log('Connected to server with ID:', socket.id);
+            console.log('Transport type:', socket.io.engine.transport.name);
 
-    // Handle stream requests
-    socket.on('start-stream', (data) => {
-        const { viewerId } = data;
+            // Send registration with additional info
+            socket.emit('register-computer', {
+                name: computerName,
+                socketId: socket.id,
+                capabilities: {
+                    webcam: true,
+                    audio: false
+                },
+                systemInfo: {
+                    platform: os.platform(),
+                    arch: os.arch(),
+                    version: os.version(),
+                    hostname: os.hostname()
+                }
+            });
 
-        console.log(`Starting stream for viewer: ${viewerId}`);
-        activeStreams.add(viewerId);
+            console.log('Computer registered');
+            console.log('Waiting for stream requests...');
+        });
 
-        // If this is the first active stream, start capturing
-        if (activeStreams.size === 1) {
-            startStreaming();
-        }
-    });
+        // Debug all socket events
+        socket.onAny((eventName, ...args) => {
+            console.log(`Received event: ${eventName}`, args);
+        });
 
-    // Handle stop stream requests
-    socket.on('stop-stream', (data) => {
-        const { viewerId } = data;
+        // Debug all emits
+        const originalEmit = socket.emit;
+        socket.emit = function(eventName, ...args) {
+            console.log(`Emitting event: ${eventName}`, args[0] ?
+                (args[0].frame ? `[Frame data: ${Math.round((args[0].frame || '').length / 1024)} KB]` : args[0])
+                : '');
+            return originalEmit.apply(this, [eventName, ...args]);
+        };
 
-        console.log(`Stopping stream for viewer: ${viewerId}`);
-        activeStreams.delete(viewerId);
+        // Add test response handler
+        socket.on('test-connection', (data) => {
+            console.log('Received test connection:', data);
+            // Send back acknowledgment
+            socket.emit('test-response', {
+                received: true,
+                time: Date.now(),
+                computerName
+            });
+        });
 
-        // If no more active streams, stop capturing
-        if (activeStreams.size === 0) {
-            stopStreaming();
-        }
-    });
+        // Handle stream requests
+        socket.on('start-stream', (data) => {
+            const { viewerId } = data;
 
-    // Handle disconnection
-    socket.on('disconnect', () => {
-        console.log('Disconnected from server');
-        stopStreaming();
-        activeStreams.clear();
+            console.log(`Starting stream for viewer: ${viewerId}`);
+            activeStreams.add(viewerId);
 
-        // Try to reconnect
-        setTimeout(() => {
-            console.log('Attempting to reconnect...');
-            socket.connect();
-        }, 5000);
-    });
+            // Acknowledge the request to the server
+            socket.emit('stream-ack', { viewerId, status: 'starting' });
 
-    // Stream management
-    let streamingInterval = null;
+            // If this is the first active stream, start capturing
+            if (activeStreams.size === 1) {
+                startStreaming();
+            }
+        });
 
-    function startStreaming() {
-        if (streamingInterval) return;
+        // Handle stop stream requests
+        socket.on('stop-stream', (data) => {
+            const { viewerId } = data;
 
-        console.log('Starting webcam capture');
-        streamingInterval = setInterval(() => {
+            console.log(`Stopping stream for viewer: ${viewerId}`);
+            activeStreams.delete(viewerId);
+
+            // If no more active streams, stop capturing
             if (activeStreams.size === 0) {
                 stopStreaming();
-                return;
             }
+        });
 
-            // Capture frame
-            Webcam.capture('temp', (err, data) => {
-                if (err) {
-                    console.error('Webcam capture error:', err);
+        // Handle disconnection
+        socket.on('disconnect', (reason) => {
+            console.log('Disconnected from server. Reason:', reason);
+
+            // Stop streaming but don't clear active streams in case we reconnect
+            stopStreaming();
+
+            console.log('Will attempt to reconnect automatically...');
+        });
+
+        // Stream management
+        let streamingInterval = null;
+        let frameCount = 0;
+        let lastFrameTime = 0;
+        let framesSent = 0;
+        let frameErrors = 0;
+
+        function startStreaming() {
+            if (streamingInterval) return;
+
+            console.log('Starting webcam capture');
+            frameCount = 0;
+            framesSent = 0;
+            frameErrors = 0;
+            lastFrameTime = Date.now();
+
+            streamingInterval = setInterval(() => {
+                if (activeStreams.size === 0) {
+                    stopStreaming();
                     return;
                 }
 
-                // Remove data:image/jpeg;base64, prefix
-                const base64Data = data.replace(/^data:image\/jpeg;base64,/, '');
+                // Capture frame
+                try {
+                    console.log('Capturing frame...');
+                    Webcam.capture('frame', (err, data) => {
+                        if (err) {
+                            console.error('Webcam capture error:', err);
+                            frameErrors++;
+                            return;
+                        }
 
-                // Send frame to each viewer
-                for (const viewerId of activeStreams) {
-                    socket.emit('webcam-frame', {
-                        viewerId,
-                        frame: base64Data
+                        // Remove data:image/jpeg;base64, prefix
+                        const base64Data = data.replace(/^data:image\/jpeg;base64,/, '');
+
+                        console.log(`Frame captured: ${Math.round(base64Data.length / 1024)} KB`);
+
+                        // Calculate FPS for logging
+                        frameCount++;
+                        framesSent++;
+                        const now = Date.now();
+                        if (now - lastFrameTime >= 5000) {
+                            const fps = frameCount / ((now - lastFrameTime) / 1000);
+                            console.log(`Streaming at ${fps.toFixed(1)} FPS, sent ${framesSent} frames, errors: ${frameErrors}`);
+                            frameCount = 0;
+                            lastFrameTime = now;
+                        }
+
+                        // Send one simplified event with just the frame data for each viewer
+                        for (const viewerId of activeStreams) {
+                            // Simplified payload - just the essential data
+                            socket.emit('webcam-frame', {
+                                viewerId,
+                                frame: base64Data,
+                                timestamp: Date.now(),
+                                frameNumber: framesSent
+                            });
+                        }
+
+                        // Try to clean up the temp file (asynchronously)
+                        fs.unlink(path.join(TEMP_DIR, 'frame.jpg'), (err) => {
+                            // Ignore errors during cleanup
+                        });
                     });
+                } catch (e) {
+                    console.error('Error during frame capture:', e);
+                    frameErrors++;
                 }
-            });
-        }, FRAME_INTERVAL);
-    }
-
-    function stopStreaming() {
-        if (streamingInterval) {
-            console.log('Stopping webcam capture');
-            clearInterval(streamingInterval);
-            streamingInterval = null;
+            }, FRAME_INTERVAL);
         }
-    }
 
-    // Handle process termination
-    process.on('SIGINT', () => {
-        console.log('\nShutting down client...');
-        stopStreaming();
-        socket.disconnect();
-        rl.close();
-        process.exit(0);
+        function stopStreaming() {
+            if (streamingInterval) {
+                console.log('Stopping webcam capture');
+                console.log(`Stats: Sent ${framesSent} frames, had ${frameErrors} errors`);
+                clearInterval(streamingInterval);
+                streamingInterval = null;
+            }
+        }
+
+        // Send periodic heartbeats to keep connection alive
+        const heartbeatInterval = setInterval(() => {
+            if (socket.connected) {
+                socket.emit('heartbeat', {
+                    computerName,
+                    timestamp: Date.now(),
+                    activeStreams: Array.from(activeStreams)
+                });
+            }
+        }, 15000);
+
+        // Handle process termination
+        process.on('SIGINT', () => {
+            console.log('\nShutting down client...');
+            stopStreaming();
+            clearInterval(heartbeatInterval);
+            socket.disconnect();
+            rl.close();
+            process.exit(0);
+        });
     });
-});
+}

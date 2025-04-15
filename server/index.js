@@ -151,14 +151,30 @@ io.on('connection', (socket) => {
 
     // Stream data relay
     socket.on('webcam-frame', (data) => {
-        // Relay the webcam frame to viewers
-        io.to(data.viewerId).emit('webcam-frame', {
-            frame: data.frame,
-            computerId: socket.id
+        const { viewerId, frame, timestamp, frameNumber } = data;
+
+        // Log frame info but not the entire frame data
+        console.log(`Relaying frame ${frameNumber} to viewer ${viewerId}, size: ${frame ? Math.round(frame.length / 1024) : 'unknown'} KB`);
+
+        // Relay the webcam frame to viewers - with simplified data format
+        io.to(viewerId).emit('webcam-frame', {
+            frame: frame,
+            computerId: socket.id,
+            timestamp: timestamp,
+            frameNumber: frameNumber
+        });
+
+        // Also relay with alternative event name for compatibility
+        io.to(viewerId).emit('frame', {
+            frame: frame,
+            computerId: socket.id,
+            timestamp: timestamp,
+            frameNumber: frameNumber
         });
 
         // Update last seen timestamp
-        if (computerInfo) {
+        if (connectedComputers.has(socket.id)) {
+            const computerInfo = connectedComputers.get(socket.id);
             computerInfo.lastSeen = new Date();
             connectedComputers.set(socket.id, computerInfo);
 
@@ -169,6 +185,24 @@ io.on('connection', (socket) => {
                 registeredComputers.set(computerInfo.id, registered);
             }
         }
+    });
+
+    socket.on('frame', (data) => {
+        const { viewerId, frame, timestamp, frameNumber } = data;
+
+        console.log(`Relaying frame (alt) ${frameNumber} to viewer ${viewerId}`);
+
+        // Relay the frame to viewers with a simplified format
+        io.to(viewerId).emit('frame', {
+            frame: frame,
+            computerId: socket.id
+        });
+
+        // Also send with the webcam-frame event name for compatibility
+        io.to(viewerId).emit('webcam-frame', {
+            frame: frame,
+            computerId: socket.id
+        });
     });
 
     // Handle stream requests
